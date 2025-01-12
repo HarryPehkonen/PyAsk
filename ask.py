@@ -20,76 +20,97 @@ class Ask:
             self.conversation_directory,
             f"{self.ai_code_name}.json"
         )
-        
+
         # Initialize LLM
         self.llm = ChatMistralAI(
             model=model_name,
             temperature=temperature
         )
-        
+
         # Initialize tools and messages
         self.tools = []
         self.module_manager = ModuleManager()
         self.module_manager.import_all(self)
         self.llm_with_tools = self.llm.bind_tools(self.tools)
         self.messages = []
-        
+
         # Initialize conversation
         self._initialize_conversation()
 
     def _initialize_conversation(self):
         """Initialize or load existing conversation"""
         system_prompt = self._get_system_prompt()
-        
+
         if self._have_saved_conversation():
             self.messages = self._load_conversation_from_disk()
-        
+
         if len(self.messages) == 0:
             self.messages.append({"content": system_prompt, "role": "system"})
         elif self.messages[0]["role"] == "system":
             self.messages[0]["content"] = system_prompt
         else:
             self.messages.insert(0, {"content": system_prompt, "role": "system"})
-            
+
         self._save_conversation_to_disk()
 
     def ask(self, prompt: str) -> str:
         """Process a single prompt and return the response"""
         if not prompt:
             return ""
-            
-        self.messages.append({"content": prompt, "role": "user"})
+
+        # give commands access
+        context = {
+            "prompt": prompt,
+            "conversation": self.messages,
+            "skip_api_call": False,
+            "response": "???"
+        }
+
+        # if the prompt starts with #, it's a command
+        if prompt[0] == '#':
+            for k, v in commands.items():
+                if prompt.startswith(k):
+                    v(k, context)
+                    # prompt = context["prompt"]
+                    break
+            print(f"{context['prompt']}");
+
+
+        if context['skip_api_call']:
+            return context['response']
+
+        self.messages.append({"content": context['prompt'], "role": "user"})
         self._save_conversation_to_disk()
-        
+
         while True:
             response = self.llm_with_tools.invoke(self.messages)
-            
+
             if not (hasattr(response, 'additional_kwargs') and 'tool_calls' in response.additional_kwargs):
                 break
-                
+
             tool_calls = response.additional_kwargs['tool_calls']
             self._handle_tool_calls(tool_calls)
-            
+
             # always update the system prompt in case it was changed
             if self.messages[0]["role"] == "system":
                 self.messages[0]["content"] = self._get_system_prompt()
-        
+
         self.messages.append({"content": response.content, "role": "assistant"})
         self._save_conversation_to_disk()
-        
+
         return response.content
 
     def _get_system_prompt(self) -> str:
         """Get the current system prompt"""
         with sqlite3.connect(self.database_filename) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT prompt FROM system_prompts WHERE ai_code_name = ?", (self.ai_code_name,))
+            cursor.execute("SELECT prompt FROM system_prompts WHERE ai_code_name = ? ORDER BY date_created DESC LIMIT 1", (self.ai_code_name,))
             prompt = cursor.fetchone()
             prompt = prompt[0] if prompt else "You are a self-modifying AI assistant."
-            
+
             table_descriptions = self._get_table_descriptions()
             column_descriptions = self._get_column_descriptions()
-            
+
             return (
                 f"System prompt:\n\n"
                 f"{prompt}\n\n"
@@ -102,14 +123,24 @@ class Ask:
 
     def _get_table_descriptions(self) -> List[Dict]:
         """Get database table descriptions"""
+        # {
+        #     "name": tablename,
+        #     "description": description
+        #     "columns": {
+        #         column_name: {
+        #             "data_type": column_data_type,
+        #             "description": column_description,
+        #         }
+        #     }
+        # }
         with sqlite3.connect(self.database_filename) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM table_metadata")
             results = cursor.fetchall()
             if not results:
                 return []
-            column_names = [description[0] for description in cursor.description]
-            return [dict(zip(column_names, row)) for row in results]
+            table_names = [description[0] for description in cursor.description]
+            return [dict(zip(table_names, row)) for row in results]
 
     def _get_column_descriptions(self) -> List[Dict]:
         """Get database column descriptions"""
@@ -245,6 +276,35 @@ def get_multiline(txt):
 def get_single_line(txt):
     return input(txt)
 
+########################################################################
+# commands
+
+def read_prompt_from_file(cmd, context):
+    prompt = context['prompt']
+
+    # remove the command part, leaving just the filename
+    filename = prompt[len(cmd):]
+    with open(filename, 'r') as f:
+        contents = f.read()
+        context['prompt'] = contents
+
+def save_response(cmd, context):
+    prompt = context['prompt']
+
+    filename = context['prompt'][len(cmd):]
+    with open(filename, 'w') as f:
+        f.write(context['conversation'][-1])
+
+    context['skip_api_call'] = True
+    context['response'] = f"The file '{filename}' was saved successfully."
+
+commands = {
+    "#file ": read_prompt_from_file,
+    "#save ": save_response
+}
+
+########################################################################
+
 if __name__ == "__main__":
 
     ai_code_name = None
@@ -275,5 +335,6 @@ if __name__ == "__main__":
         prompt = input_method("You: ")
         if len(prompt) == 0:
             break
+
         response = ai.ask(prompt)
         print(f"{ai.ai_code_name}: {response}")
